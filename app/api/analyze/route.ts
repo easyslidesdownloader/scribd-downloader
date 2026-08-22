@@ -1,8 +1,9 @@
+// @ts-ignore
 import chromium from "@sparticuz/chromium";
-import { chromium as playwrightChromium } from "playwright-core";
+import puppeteer from "puppeteer-core";
 import { extractScribdDocId, getScribdEmbedUrl } from "@/lib/scribd";
 
-export const maxDuration = 60; // Max allowed execution duration
+export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
@@ -33,48 +34,37 @@ export async function POST(request: Request) {
           const docId = extractScribdDocId(url);
           const targetUrl = docId ? getScribdEmbedUrl(docId) : url;
 
-          sendEvent("status", { message: "Launching browser and connecting..." });
+          sendEvent("status", { message: "Launching browser on server..." });
 
           if (process.env.NODE_ENV === "production") {
-            // Configure sparticuz for Vercel/AWS Lambda environment
             chromium.setGraphicsMode = false;
-
             const executablePath = await chromium.executablePath();
 
-            browser = await playwrightChromium.launch({
-              args: [
-                ...chromium.args,
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--no-sandbox",
-                "--single-process",
-                "--no-zygote",
-              ],
+            browser = await puppeteer.launch({
+              args: chromium.args,
+              defaultViewport: { width: 1200, height: 1600, deviceScaleFactor: 1.2 },
               executablePath,
               headless: true,
             });
           } else {
-            // Local dev mode
-            browser = await playwrightChromium.launch({
-              headless: true,
+            // Local fallback (using local chrome or default)
+            const executablePath = await chromium.executablePath();
+            browser = await puppeteer.launch({
               args: [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-web-security",
               ],
+              defaultViewport: { width: 1200, height: 1600, deviceScaleFactor: 1.2 },
+              executablePath,
+              headless: true,
             });
           }
 
-          const context = await browser.newContext({
-            viewport: { width: 1200, height: 1600 },
-            deviceScaleFactor: 1.2,
-            userAgent:
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          });
-
-          const page = await context.newPage();
+          const page = await browser.newPage();
+          await page.setUserAgent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+          );
 
           sendEvent("status", { message: "Loading document structure..." });
 
@@ -83,6 +73,7 @@ export async function POST(request: Request) {
             timeout: 30000,
           });
 
+          // Wait briefly for initial DOM
           try {
             await page.waitForSelector(".outer_page, .newpage, [id^='outer_page_']", {
               timeout: 15000,
@@ -91,7 +82,7 @@ export async function POST(request: Request) {
             // continue
           }
 
-          // Un-blur pages & hide promo overlays
+          // Un-blur pages & remove overlays
           await page.addStyleTag({
             content: `
               .blurred_page, .page_blur_promo {
@@ -115,7 +106,7 @@ export async function POST(request: Request) {
             `,
           });
 
-          // 1. Determine total pages
+          // Determine total pages
           const actualTotalPages = await page.evaluate(() => {
             // @ts-ignore
             if (window.scribd_doc && typeof window.scribd_doc.page_count === "number") {
@@ -140,16 +131,16 @@ export async function POST(request: Request) {
 
           const capturedPages = new Set<number>();
 
-          // 2. Stream pages one by one as they are captured
           for (let pageNum = 1; pageNum <= actualTotalPages; pageNum++) {
             if (capturedPages.has(pageNum)) continue;
 
             sendEvent("status", {
-              message: `Rendering page ${pageNum} of ${actualTotalPages}...`,
+              message: `Capturing page ${pageNum} of ${actualTotalPages}...`,
               current: pageNum,
               total: actualTotalPages,
             });
 
+            // Scroll directly to page
             await page.evaluate((targetNum) => {
               const el =
                 document.getElementById(`outer_page_${targetNum}`) ||
@@ -168,34 +159,26 @@ export async function POST(request: Request) {
               return false;
             }, pageNum);
 
-            await page.waitForTimeout(300);
+            await new Promise((r) => setTimeout(r, 350));
 
-            let pageLocator = page.locator(`#outer_page_${pageNum}`);
-            if ((await pageLocator.count()) === 0) {
-              pageLocator = page.locator(`[data-page="${pageNum}"]`);
-            }
-            if ((await pageLocator.count()) === 0) {
-              pageLocator = page.locator(`#page_${pageNum}`);
-            }
+            // Select outer page element
+            const elHandle = await page.$(
+              `#outer_page_${pageNum}, [data-page="${pageNum}"], #page_${pageNum}`
+            );
 
-            if ((await pageLocator.count()) > 0) {
+            if (elHandle) {
               try {
-                const target = pageLocator.first();
-                await target.scrollIntoViewIfNeeded();
-                await page.waitForTimeout(100);
-
-                const boundingBox = await target.boundingBox();
+                const boundingBox = await elHandle.boundingBox();
 
                 if (
                   boundingBox &&
                   boundingBox.width > 50 &&
                   boundingBox.height > 50
                 ) {
-                  const imageBuffer = await target.screenshot({
+                  const imageBuffer = (await elHandle.screenshot({
                     type: "jpeg",
                     quality: 80,
-                    animations: "disabled",
-                  });
+                  })) as Buffer;
 
                   const pageData = {
                     pageNumber: pageNum,
