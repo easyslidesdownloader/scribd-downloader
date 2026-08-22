@@ -34,14 +34,14 @@ export async function POST(request: Request) {
         };
 
         try {
-          sendEvent("status", { message: "Fetching document structure..." });
+          sendEvent("status", { message: "Analyzing document..." });
 
-          // 1. Get document metadata & asset map
           const meta = await fetchDocumentMetadata(docId);
 
           if (!meta.pages || meta.pages.length === 0) {
-            // Fallback: If direct JSONP URLs weren't embedded in HTML, construct standard CDN format
-            sendEvent("status", { message: "Parsing document pages..." });
+            throw new Error(
+              "No public page assets found for this document. It may be restricted by Scribd."
+            );
           }
 
           const totalPages = Math.max(meta.pageCount, meta.pages.length);
@@ -49,7 +49,6 @@ export async function POST(request: Request) {
 
           let capturedCount = 0;
 
-          // 2. Fetch and render each page asset
           for (let i = 0; i < meta.pages.length; i++) {
             const pageItem = meta.pages[i];
             const pageNum = pageItem.pageNum;
@@ -61,12 +60,11 @@ export async function POST(request: Request) {
             });
 
             try {
-              // Fetch page JSONP containing SVG / HTML / Image layers
               const pageRes = await fetch(pageItem.jsonpUrl, {
                 headers: {
                   "User-Agent":
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                  "Referer": "https://www.scribd.com/",
+                  Referer: "https://www.scribd.com/",
                 },
               });
 
@@ -74,7 +72,7 @@ export async function POST(request: Request) {
 
               const rawText = await pageRes.text();
 
-              // Extract the HTML/SVG payload from window.pageN_callback(["..."])
+              // Parse JSONP payload: window.pageN_callback(["..."])
               const jsonpMatch = rawText.match(
                 /window\.page\d+_callback\(\s*(\[[\s\S]*\])\s*\);?/
               );
@@ -90,37 +88,44 @@ export async function POST(request: Request) {
               const width = widthMatch ? parseInt(widthMatch[1], 10) : 900;
               const height = heightMatch ? parseInt(heightMatch[1], 10) : 1200;
 
-              // Check if page has an embedded background image (JPEG / PNG)
-              const imgMatch =
-                rawHtml.match(/src="([^"]+\.(?:jpg|jpeg|png))"/i) ||
-                rawHtml.match(/url\(['"]?([^'"\)]+\.(?:jpg|jpeg|png))['"]?\)/i) ||
-                rawHtml.match(/xlink:href="([^"]+)"/i);
+              // Find base URL for images from jsonpUrl
+              const cdnBase = pageItem.jsonpUrl.substring(
+                0,
+                pageItem.jsonpUrl.indexOf("/pages/")
+              );
+
+              // Extract image URLs (jpeg, jpg, png)
+              const imgMatches = [
+                ...rawHtml.matchAll(/src="([^"]+\.(?:jpg|jpeg|png|webp))"/gi),
+                ...rawHtml.matchAll(/url\(['"]?([^'"\)]+\.(?:jpg|jpeg|png|webp))['"]?\)/gi),
+                ...rawHtml.matchAll(/xlink:href="([^"]+)"/gi),
+              ];
 
               let imageSrc = "";
 
-              if (imgMatch && imgMatch[1]) {
-                const relativeUrl = imgMatch[1];
-                imageSrc = relativeUrl.startsWith("http")
-                  ? relativeUrl
-                  : `https://html.scribdassets.com/${docId}/images/${relativeUrl.replace(/^\.?\/?images\//, "")}`;
+              if (imgMatches.length > 0 && imgMatches[0][1]) {
+                const imgPath = imgMatches[0][1];
+                const fullImgUrl = imgPath.startsWith("http")
+                  ? imgPath
+                  : `${cdnBase}/${imgPath.replace(/^\.?\/?/, "")}`;
 
-                // Fetch the image buffer and convert to base64 so client renders offline
-                const imgRes = await fetch(imageSrc, {
-                  headers: { "Referer": "https://www.scribd.com/" },
+                const imgRes = await fetch(fullImgUrl, {
+                  headers: { Referer: "https://www.scribd.com/" },
                 });
 
                 if (imgRes.ok) {
                   const buffer = Buffer.from(await imgRes.arrayBuffer());
-                  imageSrc = `data:image/jpeg;base64,${buffer.toString("base64")}`;
+                  const mimeType = fullImgUrl.endsWith(".png") ? "image/png" : "image/jpeg";
+                  imageSrc = `data:${mimeType};base64,${buffer.toString("base64")}`;
                 }
               }
 
-              // If no raster image was found, create clean SVG data URI
+              // Fallback if page is pure HTML/vector text: embed as styled SVG data URI
               if (!imageSrc) {
                 const svgContent = `
                   <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
                     <foreignObject width="100%" height="100%">
-                      <div xmlns="http://www.w3.org/1999/xhtml" style="width:${width}px;height:${height}px;background:white;font-family:sans-serif;padding:20px;box-sizing:border-box;">
+                      <div xmlns="http://www.w3.org/1999/xhtml" style="width:${width}px;height:${height}px;background:white;font-family:sans-serif;box-sizing:border-box;overflow:hidden;position:relative;">
                         ${rawHtml}
                       </div>
                     </foreignObject>
@@ -137,13 +142,13 @@ export async function POST(request: Request) {
                 height,
               });
             } catch (pageErr) {
-              console.warn(`Error on page ${pageNum}:`, pageErr);
+              console.warn(`Error rendering page ${pageNum}:`, pageErr);
             }
           }
 
           if (capturedCount === 0) {
             sendEvent("error", {
-              message: "Unable to parse pages from this document. Please check the URL.",
+              message: "Could not load document pages. The document might be private or premium-only.",
             });
           } else {
             sendEvent("complete", { total: capturedCount });

@@ -1,8 +1,6 @@
 export type ScribdPageInfo = {
   pageNum: number;
-  imageUrl: string;
-  width: number;
-  height: number;
+  jsonpUrl: string;
 };
 
 export function extractScribdDocId(url: string): string | null {
@@ -17,73 +15,89 @@ export function extractScribdDocId(url: string): string | null {
 export async function fetchDocumentMetadata(docId: string): Promise<{
   pageCount: number;
   title: string;
-  secretPassword?: string;
-  pages: { pageNum: number; jsonpUrl: string }[];
+  pages: ScribdPageInfo[];
 }> {
-  // Fetch the embed page HTML which contains the JSON metadata
+  // Fetch the embed document HTML
   const embedUrl = `https://www.scribd.com/embeds/${docId}/content?start_page=1&view_mode=scroll`;
-  
+
   const res = await fetch(embedUrl, {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
+      Referer: "https://www.scribd.com/",
     },
   });
 
   if (!res.ok) {
-    throw new Error(`Failed to load Scribd document metadata (HTTP ${res.status})`);
+    throw new Error(`Failed to load Scribd document (HTTP ${res.status})`);
   }
 
   const html = await res.text();
 
-  // 1. Extract JSON metadata inside the embed page
-  let pageCount = 0;
+  // 1. Extract Title
   let title = "Scribd Document";
-
-  // Try matching page count
-  const pageCountMatch =
-    html.match(/"page_count"\s*:\s*(\d+)/) ||
-    html.match(/page_count\s*=\s*(\d+)/) ||
-    html.match(/total_pages\s*=\s*(\d+)/) ||
-    html.match(/data-page-count="(\d+)"/);
-
-  if (pageCountMatch) {
-    pageCount = parseInt(pageCountMatch[1], 10);
-  }
-
-  // Try matching title
   const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
   if (titleMatch) {
     title = titleMatch[1].replace(/ - Scribd$/i, "").trim();
   }
 
-  // 2. Find all page JSONP / image asset URLs in the document
-  const pageUrlsMap = new Map<number, string>();
-  const pageUrlRegex = /https:\/\/html\.scribdassets\.com\/[a-z0-9]+\/pages\/(\d+)-[a-z0-9]+\.jsonp/gi;
-  let match;
+  // 2. Extract Total Page Count
+  let pageCount = 0;
+  const countMatch =
+    html.match(/page_count["':\s]+(\d+)/i) ||
+    html.match(/total_pages["':\s]+(\d+)/i) ||
+    html.match(/"pageCount"\s*:\s*(\d+)/i) ||
+    html.match(/data-page-count="(\d+)"/i);
 
-  while ((match = pageUrlRegex.exec(html)) !== null) {
-    const pageNum = parseInt(match[1], 10);
-    if (!pageUrlsMap.has(pageNum)) {
-      pageUrlsMap.set(pageNum, match[0]);
+  if (countMatch) {
+    pageCount = parseInt(countMatch[1], 10);
+  }
+
+  // 3. Find Page JSONP URLs
+  const pages: ScribdPageInfo[] = [];
+  const foundPageNums = new Set<number>();
+
+  // Pattern A: Direct full URLs matching scribdassets.com
+  const directRegex = /(https:\/\/html\.scribdassets\.com\/[a-zA-Z0-9_\-\.]+\/pages\/(\d+)-[a-zA-Z0-9_\-\.]+\.jsonp)/gi;
+  let match;
+  while ((match = directRegex.exec(html)) !== null) {
+    const pageNum = parseInt(match[2], 10);
+    if (!foundPageNums.has(pageNum)) {
+      foundPageNums.add(pageNum);
+      pages.push({ pageNum, jsonpUrl: match[1] });
     }
   }
 
-  // Fallback: If page count wasn't in the JSON, use the detected URLs length
-  if (pageCount === 0) {
-    pageCount = pageUrlsMap.size > 0 ? pageUrlsMap.size : 1;
+  // Pattern B: Asset prefix + page hashes in Scribd JS parameters
+  if (pages.length === 0) {
+    // Look for content directory or prefix (e.g. "https://html.scribdassets.com/xxxxxx/")
+    const prefixMatch =
+      html.match(/https:\/\/html\.scribdassets\.com\/[a-zA-Z0-9_\-\.]+\//i) ||
+      html.match(/"(https:\/\/html\d*\.scribdassets\.com\/[^"]+\/)"/i);
+
+    // Look for page filename patterns like "pages/1-xxxx.jsonp" or "1-xxxx"
+    const pageHashRegex = /["'](?:pages\/)?(\d+)-([a-zA-Z0-9_\-\.]+)\.jsonp["']/gi;
+    let hashMatch;
+
+    const basePrefix = prefixMatch ? prefixMatch[0].replace(/"/g, "") : `https://html.scribdassets.com/${docId}/`;
+
+    while ((hashMatch = pageHashRegex.exec(html)) !== null) {
+      const pageNum = parseInt(hashMatch[1], 10);
+      const hash = hashMatch[2];
+      if (!foundPageNums.has(pageNum)) {
+        foundPageNums.add(pageNum);
+        const cleanUrl = `${basePrefix.replace(/\/pages\/$/, "").replace(/\/$/, "")}/pages/${pageNum}-${hash}.jsonp`;
+        pages.push({ pageNum, jsonpUrl: cleanUrl });
+      }
+    }
   }
 
-  const pages = [];
-  for (const [pageNum, jsonpUrl] of pageUrlsMap.entries()) {
-    pages.push({ pageNum, jsonpUrl });
-  }
   pages.sort((a, b) => a.pageNum - b.pageNum);
 
   return {
-    pageCount,
+    pageCount: pageCount || pages.length || 1,
     title,
     pages,
   };
