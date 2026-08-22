@@ -68,19 +68,22 @@ export async function POST(request: Request) {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
           );
 
-          sendEvent("status", { message: "Loading document structure..." });
+          sendEvent("status", { message: "Connecting to Scribd document..." });
 
           await page.goto(targetUrl, {
             waitUntil: "domcontentloaded",
-            timeout: 30000,
+            timeout: 35000,
           });
 
-          // Un-blur pages & remove overlays safely via DOM injection
+          // Wait 2 seconds for Scribd client-side renderer to initialize
+          await new Promise((r) => setTimeout(r, 2000));
+
+          // Un-blur pages & hide promo overlays
           await page.evaluate(() => {
             try {
               const style = document.createElement("style");
               style.innerHTML = `
-                .blurred_page, .page_blur_promo {
+                .blurred_page, .page_blur_promo, .newpage, .outer_page, [data-page] {
                   filter: none !important;
                   -webkit-filter: none !important;
                   opacity: 1 !important;
@@ -100,12 +103,10 @@ export async function POST(request: Request) {
                 }
               `;
               document.head?.appendChild(style);
-            } catch (e) {
-              console.warn("Could not inject custom style tag", e);
-            }
+            } catch (e) {}
           });
 
-          // Determine total pages
+          // 1. Detect total pages accurately
           const actualTotalPages = await page.evaluate(() => {
             // @ts-ignore
             if (window.scribd_doc && typeof window.scribd_doc.page_count === "number") {
@@ -113,23 +114,26 @@ export async function POST(request: Request) {
               return window.scribd_doc.page_count;
             }
             const pageIndicator = document.querySelector(
-              ".page_number, .page_count, .total_pages"
+              ".page_number, .page_count, .total_pages, [data-page-count]"
             );
             if (pageIndicator?.textContent) {
               const match = pageIndicator.textContent.match(/(?:of|\/)\s*(\d+)/i);
               if (match) return parseInt(match[1], 10);
             }
-            const outerWrappers = document.querySelectorAll(
-              "[id^='outer_page_'], .outer_page"
-            );
-            if (outerWrappers.length > 0) return outerWrappers.length;
-            return 30;
+
+            const outerCount = document.querySelectorAll(
+              "[id^='outer_page_'], .outer_page, .newpage, [data-page]"
+            ).length;
+            return outerCount > 0 ? outerCount : 8;
           });
 
+          console.log("Total document pages detected:", actualTotalPages);
           sendEvent("init", { totalPages: actualTotalPages });
 
           const capturedPages = new Set<number>();
+          let consecutiveMisses = 0;
 
+          // 2. Iterate through each page sequentially
           for (let pageNum = 1; pageNum <= actualTotalPages; pageNum++) {
             if (capturedPages.has(pageNum)) continue;
 
@@ -139,40 +143,69 @@ export async function POST(request: Request) {
               total: actualTotalPages,
             });
 
-            // Scroll directly to page
-            await page.evaluate((targetNum) => {
-              const el =
-                document.getElementById(`outer_page_${targetNum}`) ||
-                document.getElementById(`page_${targetNum}`) ||
-                document.querySelector(`[data-page="${targetNum}"]`) ||
-                document.querySelector(`.outer_page:nth-of-type(${targetNum})`);
+            // Scroll the page element into view and prepare it
+            const pageFound = await page.evaluate((targetNum) => {
+              const selectors = [
+                `#outer_page_${targetNum}`,
+                `[data-page="${targetNum}"]`,
+                `#page_${targetNum}`,
+                `.outer_page:nth-of-type(${targetNum})`,
+                `.newpage:nth-of-type(${targetNum})`,
+              ];
+
+              let el: HTMLElement | null = null;
+              for (const sel of selectors) {
+                const found = document.querySelector(sel) as HTMLElement | null;
+                if (found) {
+                  el = found;
+                  break;
+                }
+              }
 
               if (el) {
-                (el as HTMLElement).style.filter = "none";
-                (el as HTMLElement).style.opacity = "1";
-                (el as HTMLElement).style.display = "block";
+                el.style.filter = "none";
+                el.style.opacity = "1";
+                el.style.display = "block";
                 el.scrollIntoView({ behavior: "instant", block: "center" });
                 return true;
               }
-              window.scrollBy(0, 800);
+
+              window.scrollBy(0, 900);
               return false;
             }, pageNum);
 
-            await new Promise((r) => setTimeout(r, 350));
+            // Wait for lazy images/fonts to render
+            await new Promise((r) => setTimeout(r, 450));
 
-            // Select outer page element
-            const elHandle = await page.$(
+            // Find matching element handle
+            let elHandle = await page.$(
               `#outer_page_${pageNum}, [data-page="${pageNum}"], #page_${pageNum}`
             );
 
+            if (!elHandle) {
+              const allPages = await page.$$(".outer_page, .newpage, [data-page]");
+              if (allPages.length >= pageNum) {
+                elHandle = allPages[pageNum - 1];
+              }
+            }
+
             if (elHandle) {
               try {
+                // Scroll into view via handle
+                await elHandle.evaluate((node) => {
+                  (node as HTMLElement).scrollIntoView({
+                    behavior: "instant",
+                    block: "center",
+                  });
+                });
+                await new Promise((r) => setTimeout(r, 150));
+
                 const boundingBox = await elHandle.boundingBox();
 
                 if (
                   boundingBox &&
-                  boundingBox.width > 50 &&
-                  boundingBox.height > 50
+                  boundingBox.width >= 50 &&
+                  boundingBox.height >= 50
                 ) {
                   const imageBuffer = (await elHandle.screenshot({
                     type: "jpeg",
@@ -187,15 +220,29 @@ export async function POST(request: Request) {
                   };
 
                   capturedPages.add(pageNum);
+                  consecutiveMisses = 0;
                   sendEvent("page", pageData);
+                  continue;
                 }
               } catch (err) {
-                console.warn(`Failed to capture page ${pageNum}:`, err);
+                console.warn(`Could not screenshot page element ${pageNum}:`, err);
               }
+            }
+
+            consecutiveMisses++;
+            if (consecutiveMisses >= 3 && pageNum > 3) {
+              console.log("Reached end of accessible document stream.");
+              break;
             }
           }
 
-          sendEvent("complete", { total: capturedPages.size });
+          if (capturedPages.size === 0) {
+            sendEvent("error", {
+              message: "No readable pages could be rendered from this document.",
+            });
+          } else {
+            sendEvent("complete", { total: capturedPages.size });
+          }
         } catch (err) {
           console.error("Stream error:", err);
           sendEvent("error", {
