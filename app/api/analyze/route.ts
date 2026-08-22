@@ -1,10 +1,14 @@
 // @ts-ignore
-import chromium from "@sparticuz/chromium";
+import chromium from "@sparticuz/chromium-min";
 import puppeteer from "puppeteer-core";
 import { extractScribdDocId, getScribdEmbedUrl } from "@/lib/scribd";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
+
+// Official compiled Chromium binary release for Sparticuz
+const CHROMIUM_PACK_URL =
+  "https://github.com/Sparticuz/chromium/releases/download/v131.0.1/chromium-v131.0.1-pack.tar";
 
 export async function POST(request: Request) {
   try {
@@ -34,11 +38,13 @@ export async function POST(request: Request) {
           const docId = extractScribdDocId(url);
           const targetUrl = docId ? getScribdEmbedUrl(docId) : url;
 
-          sendEvent("status", { message: "Launching browser on server..." });
+          sendEvent("status", { message: "Launching serverless browser..." });
 
           if (process.env.NODE_ENV === "production") {
             chromium.setGraphicsMode = false;
-            const executablePath = await chromium.executablePath();
+            
+            // Pass the remote binary pack URL so it unpacks to /tmp reliably
+            const executablePath = await chromium.executablePath(CHROMIUM_PACK_URL);
 
             browser = await puppeteer.launch({
               args: chromium.args,
@@ -47,7 +53,7 @@ export async function POST(request: Request) {
               headless: true,
             });
           } else {
-            // Local fallback (using local chrome or default)
+            // Local dev mode
             const executablePath = await chromium.executablePath();
             browser = await puppeteer.launch({
               args: [
@@ -73,7 +79,6 @@ export async function POST(request: Request) {
             timeout: 30000,
           });
 
-          // Wait briefly for initial DOM
           try {
             await page.waitForSelector(".outer_page, .newpage, [id^='outer_page_']", {
               timeout: 15000,
@@ -89,7 +94,6 @@ export async function POST(request: Request) {
                 filter: none !important;
                 -webkit-filter: none !important;
                 opacity: 1 !important;
-                visibility: visible !important;
               }
               .page_blur_promo,
               .between_page_module,
