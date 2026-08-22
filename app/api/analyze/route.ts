@@ -37,12 +37,13 @@ export async function POST(request: Request) {
         sendEvent("status", { message: "Launching browser and connecting to Scribd..." });
 
         // --- BROWSER LAUNCH LOGIC (Vercel Production vs. Local Development) ---
+        // --- BROWSER LAUNCH LOGIC (Vercel Production vs. Local Development) ---
         if (process.env.NODE_ENV === "production") {
+          const executablePath = await chromium.executablePath();
           browser = await playwrightChromium.launch({
             args: chromium.args,
-            defaultViewport: chromium.defaultViewport,
-            executablePath: await chromium.executablePath(),
-            headless: chromium.headless,
+            executablePath,
+            headless: true,
           });
         } else {
           browser = await playwrightChromium.launch({
