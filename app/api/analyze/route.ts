@@ -37,55 +37,116 @@ export async function POST(request: Request) {
           const docId = extractScribdDocId(url);
           const targetUrl = docId ? getScribdEmbedUrl(docId) : url;
 
-          sendEvent("status", { message: "Launching serverless browser..." });
+          sendEvent("status", { message: "Initializing stealth browser..." });
+
+          const launchArgs = [
+            ...(process.env.NODE_ENV === "production" ? chromium.args : []),
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--window-size=1280,1600",
+          ];
 
           if (process.env.NODE_ENV === "production") {
             chromium.setGraphicsMode = false;
             const executablePath = await chromium.executablePath(CHROMIUM_PACK_URL);
 
             browser = await puppeteer.launch({
-              args: [
-                ...chromium.args,
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--window-size=1200,1600",
-              ],
-              defaultViewport: { width: 1200, height: 1600, deviceScaleFactor: 1 },
+              args: launchArgs,
+              defaultViewport: { width: 1280, height: 1600, deviceScaleFactor: 1 },
               executablePath,
               headless: true,
             });
           } else {
             const executablePath = await chromium.executablePath();
             browser = await puppeteer.launch({
-              args: [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-              ],
-              defaultViewport: { width: 1200, height: 1600, deviceScaleFactor: 1 },
+              args: launchArgs,
+              defaultViewport: { width: 1280, height: 1600, deviceScaleFactor: 1 },
               executablePath,
               headless: true,
             });
           }
 
           const page = await browser.newPage();
+
+          // 1. Set real human desktop headers
           await page.setUserAgent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
           );
 
-          sendEvent("status", { message: "Connecting to Scribd document..." });
+          await page.setExtraHTTPHeaders({
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+          });
+
+          // 2. STEALTH EVASION SCRIPT: Strip automation flags before page loads
+          await page.evaluateOnNewDocument(() => {
+            // Mask navigator.webdriver
+            Object.defineProperty(navigator, "webdriver", {
+              get: () => undefined,
+            });
+
+            // Fake chrome runtime object
+            // @ts-ignore
+            window.chrome = {
+              runtime: {},
+              loadTimes: function () {},
+              csi: function () {},
+              app: {},
+            };
+
+            // Fake realistic plugins
+            Object.defineProperty(navigator, "plugins", {
+              get: () => [
+                { name: "PDF Viewer", filename: "internal-pdf-viewer" },
+                { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer" },
+                { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer" },
+              ],
+            });
+
+            // Fake languages
+            Object.defineProperty(navigator, "languages", {
+              get: () => ["en-US", "en"],
+            });
+          });
+
+          sendEvent("status", { message: "Accessing Scribd document..." });
 
           await page.goto(targetUrl, {
             waitUntil: "domcontentloaded",
             timeout: 35000,
           });
 
-          // Wait 2.5s for initial layout
+          // Wait 2.5 seconds for document or challenge to settle
           await new Promise((r) => setTimeout(r, 2500));
 
-          // Un-blur pages & hide promo overlays
+          // 3. CHECK FOR CAPTCHA CHALLENGE
+          const isCaptcha = await page.evaluate(() => {
+            const text = document.body.innerText || "";
+            return (
+              text.includes("Enter the characters seen in the image") ||
+              text.includes("CAPTCHA") ||
+              document.querySelector("input[name='captcha_response']") !== null ||
+              document.querySelector(".captcha_box") !== null
+            );
+          });
+
+          if (isCaptcha) {
+            throw new Error(
+              "Scribd rate-limited this server request with a CAPTCHA. Please try again in 1 minute or try another document."
+            );
+          }
+
+          // Un-blur pages & remove promo popups
           await page.evaluate(() => {
             try {
               const style = document.createElement("style");
@@ -114,7 +175,7 @@ export async function POST(request: Request) {
             } catch (e) {}
           });
 
-          // 1. Detect total pages
+          // 4. Detect exact total page count
           const actualTotalPages = await page.evaluate(() => {
             // @ts-ignore
             if (window.scribd_doc && typeof window.scribd_doc.page_count === "number") {
@@ -132,15 +193,19 @@ export async function POST(request: Request) {
             const outerCount = document.querySelectorAll(
               "[id^='outer_page_'], .outer_page, .newpage, [data-page]"
             ).length;
-            return outerCount > 0 ? outerCount : 8;
+            return outerCount > 0 ? outerCount : 0;
           });
+
+          if (actualTotalPages === 0) {
+            throw new Error("Unable to locate document pages. The document might be private or removed.");
+          }
 
           console.log(`Verified total pages: ${actualTotalPages}`);
           sendEvent("init", { totalPages: actualTotalPages });
 
           const capturedPages = new Set<number>();
 
-          // 2. Iterate through each page using DOM-rect viewport clipping
+          // 5. Capture pages sequentially
           for (let pageNum = 1; pageNum <= actualTotalPages; pageNum++) {
             if (capturedPages.has(pageNum)) continue;
 
@@ -175,7 +240,6 @@ export async function POST(request: Request) {
                 el.style.opacity = "1";
                 el.style.display = "block";
                 
-                // Align top of page to top of viewport
                 el.scrollIntoView({ behavior: "instant", block: "start" });
 
                 const r = el.getBoundingClientRect();
@@ -187,13 +251,12 @@ export async function POST(request: Request) {
                 };
               }
 
-              // If not found, scroll down
               window.scrollBy(0, 900);
               return null;
             }, pageNum);
 
-            // Wait for assets (images, fonts, SVGs) to settle
-            await new Promise((r) => setTimeout(r, 400));
+            // Wait for assets to render
+            await new Promise((r) => setTimeout(r, 450));
 
             try {
               let imageBuffer: Buffer | null = null;
@@ -201,7 +264,7 @@ export async function POST(request: Request) {
               let clipHeight = 1200;
 
               if (rect && rect.width > 50 && rect.height > 50) {
-                clipWidth = Math.min(1200, rect.width);
+                clipWidth = Math.min(1280, rect.width);
                 clipHeight = Math.min(1600, rect.height);
 
                 imageBuffer = (await page.screenshot({
@@ -215,7 +278,6 @@ export async function POST(request: Request) {
                   },
                 })) as Buffer;
               } else {
-                // Direct fallback: screenshot top portion of current viewport
                 imageBuffer = (await page.screenshot({
                   type: "jpeg",
                   quality: 80,
@@ -238,7 +300,6 @@ export async function POST(request: Request) {
 
                 capturedPages.add(pageNum);
                 sendEvent("page", pageData);
-                console.log(`✓ Page ${pageNum} captured successfully`);
               }
             } catch (err) {
               console.warn(`Screenshot error for page ${pageNum}:`, err);
