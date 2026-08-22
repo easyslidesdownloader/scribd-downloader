@@ -6,7 +6,6 @@ import { extractScribdDocId, getScribdEmbedUrl } from "@/lib/scribd";
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
-// Official compiled Chromium binary release for Sparticuz
 const CHROMIUM_PACK_URL =
   "https://github.com/Sparticuz/chromium/releases/download/v131.0.1/chromium-v131.0.1-pack.tar";
 
@@ -42,8 +41,6 @@ export async function POST(request: Request) {
 
           if (process.env.NODE_ENV === "production") {
             chromium.setGraphicsMode = false;
-            
-            // Pass the remote binary pack URL so it unpacks to /tmp reliably
             const executablePath = await chromium.executablePath(CHROMIUM_PACK_URL);
 
             browser = await puppeteer.launch({
@@ -53,7 +50,6 @@ export async function POST(request: Request) {
               headless: true,
             });
           } else {
-            // Local dev mode
             const executablePath = await chromium.executablePath();
             browser = await puppeteer.launch({
               args: [
@@ -79,35 +75,34 @@ export async function POST(request: Request) {
             timeout: 30000,
           });
 
-          try {
-            await page.waitForSelector(".outer_page, .newpage, [id^='outer_page_']", {
-              timeout: 15000,
-            });
-          } catch {
-            // continue
-          }
-
-          // Un-blur pages & remove overlays
-          await page.addStyleTag({
-            content: `
-              .blurred_page, .page_blur_promo {
-                filter: none !important;
-                -webkit-filter: none !important;
-                opacity: 1 !important;
-              }
-              .page_blur_promo,
-              .between_page_module,
-              .between_page_portal_root,
-              .auto_load_wrapper,
-              .header_container,
-              .toolbar_top,
-              .document_actions,
-              #banner_wrapper,
-              .mobile_sticky_footer,
-              .upgrade_account_btn {
-                display: none !important;
-              }
-            `,
+          // Un-blur pages & remove overlays safely via DOM injection
+          await page.evaluate(() => {
+            try {
+              const style = document.createElement("style");
+              style.innerHTML = `
+                .blurred_page, .page_blur_promo {
+                  filter: none !important;
+                  -webkit-filter: none !important;
+                  opacity: 1 !important;
+                  visibility: visible !important;
+                }
+                .page_blur_promo,
+                .between_page_module,
+                .between_page_portal_root,
+                .auto_load_wrapper,
+                .header_container,
+                .toolbar_top,
+                .document_actions,
+                #banner_wrapper,
+                .mobile_sticky_footer,
+                .upgrade_account_btn {
+                  display: none !important;
+                }
+              `;
+              document.head?.appendChild(style);
+            } catch (e) {
+              console.warn("Could not inject custom style tag", e);
+            }
           });
 
           // Determine total pages
